@@ -1,40 +1,45 @@
 # termux-smooth-cursor
 
-เคอร์เซอร์สมูทมีหางลากตามสำหรับ Termux ติดตั้งด้วยคำสั่งเดียว **ไม่ต้องลง APK ใหม่ ไม่แก้ตัวแอป Termux**
-ลบออกแล้ว Termux กลับมาเป็นแบบเดิมทุกอย่าง
+A smooth, trailing cursor for Termux. One-line install, **no APK, and Termux itself is never modified**.
+Remove it and everything goes back to stock.
 
-A smooth, trailing cursor for Termux. One-line install, **no APK, Termux itself is untouched**.
-Remove it and everything is back to stock.
+> **Note:** the trail moves one character cell at a time (not pixel-smooth) and may flicker slightly on some devices.
 
-## ติดตั้ง / Install
+## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kizuyamaki/termux-smooth-cursor/main/install.sh | sh
 ```
 
-ตัวติดตั้งจะลง: `python`, `curl`, ไลบรารี `pyte` (ผ่าน pip) และตัวโปรแกรม `smoothcursor`
+The installer sets up:
 
-## เปิดใช้ / Use
+- `python` and `curl` (via `pkg`)
+- `pyte` (via `pip`)
+- the `smoothcursor` command in `$PREFIX/bin`
+
+## Use
+
+Start a shell with the smooth cursor:
 
 ```sh
 smoothcursor
 ```
 
-จะเข้า shell ใหม่ที่มีเคอร์เซอร์สมูท ออกด้วย `exit` แล้วกลับมาเป็นแบบปกติ
+Type `exit` to leave it and go back to the normal shell.
 
-ให้เปิดอัตโนมัติทุก session:
+Start it automatically in every new session:
 
 ```sh
 smoothcursor autostart on
 ```
 
-ปิดอัตโนมัติ:
+Turn automatic start off:
 
 ```sh
 smoothcursor autostart off
 ```
 
-## ปรับแต่ง / Customize
+## Customize
 
 ```sh
 smoothcursor set speed 40
@@ -48,35 +53,36 @@ smoothcursor set color '#ff88cc'
 smoothcursor set enabled false
 ```
 
-| key | ค่า | ความหมาย |
+| Key | Value | Meaning |
 |---|---|---|
-| speed | 10-500 | มิลลิวินาที ยิ่งน้อยยิ่งเร็ว (ค่าเริ่มต้น 60) |
-| color | `#rrggbb` | สีของหาง |
-| enabled | true / false | เปิดปิดเอฟเฟกต์ |
+| `speed` | 10-500 | Milliseconds; lower is faster (default 60) |
+| `color` | `#rrggbb` | Trail color |
+| `enabled` | `true` / `false` | Turn the effect on or off |
 
-ค่าใหม่มีผลกับ session ใหม่ ไฟล์ตั้งค่าอยู่ที่ `~/.termux/smooth-cursor.conf`
+Changes apply to new sessions. Settings are stored in `~/.termux/smooth-cursor.conf`.
 
-## ถอนการติดตั้ง / Uninstall
+## Uninstall
 
 ```sh
 smoothcursor uninstall
 ```
 
-ลบโปรแกรม ไฟล์ตั้งค่า และบรรทัดเปิดอัตโนมัติออกทั้งหมด (ถ้าอยากลบ pyte ด้วย: `pip uninstall pyte`)
+This removes the program, the config file and the autostart lines. To remove the library too: `pip uninstall pyte`.
 
-## ถ้าเปิดอัตโนมัติแล้วมีปัญหา / Emergency off
+## Emergency off
+
+If autostart ever causes trouble, this disables it immediately without editing any other file:
 
 ```sh
 touch ~/.termux/smooth-cursor.off
 ```
 
-คำสั่งนี้ปิดการเปิดอัตโนมัติทันทีโดยไม่ต้องแก้ไฟล์อื่น (ถ้าระบบเปิด shell ซ้อน พิมพ์ `exit` หนึ่งครั้งก็กลับมาเป็นแบบปกติ)
+If a nested shell opened, typing `exit` once returns you to the normal shell. If `pyte` is missing or the program crashes, it falls back to your plain shell instead of locking you out.
 
-## วิธีทำงาน / How it works
+## How it works
 
-โปรแกรมคั่นอยู่ระหว่าง Termux กับ shell คอยจับตำแหน่งเคอร์เซอร์ แล้ววาดหางสีตามหลังด้วย
-escape code ธรรมดา และลบหางก่อนที่โปรแกรมจะวาดอะไรใหม่ เพื่อไม่ให้หน้าจอเพี้ยน
+`smoothcursor` sits between Termux and your shell. It tracks the cursor position and paints a fading trail behind it using ordinary terminal escape codes. Before the shell draws anything new, the trail is erased, so the screen is never corrupted.
 
-ข้อจำกัด: หางลากทีละช่องตัวอักษร (ไม่ละเอียดแบบ pixel) และอาจกะพริบเล็กน้อยบางเครื่อง
+## License
 
-License: MIT
+MIT
