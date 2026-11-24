@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""smoothcursor - run your shell with a smooth, trailing cursor (no APK needed).
+
+It sits between Termux and your shell, tracks where the cursor is, and paints a
+fading trail behind it using normal terminal escape codes.
+
+Commands:
+    smoothcursor                      start a shell with the smooth cursor
+    smoothcursor set <key> <value>    change a setting (enabled / speed / color)
+    smoothcursor autostart on|off     start it automatically in every new session
+    smoothcursor uninstall            remove everything and restore stock behavior
+
+Config (optional): ~/.termux/smooth-cursor.conf
+    enabled=true     # true / false
+    speed=60         # 10-500 ms, lower = faster
+    color=#b4a7ff    # trail color
+"""
+import fcntl
+import math
+import os
+import pty
+import re
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+import tty
+
+try:
+    import pyte
+    import pyte.graphics as pg
+except ImportError:  # never lock the user out of their shell
+    sh = os.environ.get("SHELL", "sh")
+    sys.stderr.write("smoothcursor: 'pyte' is missing (run: pip install pyte). Starting plain shell.\n")
+    os.execvp(sh, [sh])
+
+CONF = os.path.expanduser("~/.termux/smooth-cursor.conf")
+ALT_RE = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
+
+FG = {v: k for k, v in list(pg.FG_ANSI.items()) + list(pg.FG_AIXTERM.items())}
+BG = {v: k for k, v in list(pg.BG_ANSI.items()) + list(pg.BG_AIXTERM.items())}
+
+
+def load_conf():
+    conf = {"enabled": "true", "speed": "60", "color": "#b4a7ff"}
+    try:
+        with open(CONF) as f:
+            for line in f:
+                line = line.split("#", 1)[0] if not line.lstrip().startswith("color") else line
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    conf[k.strip()] = v.split(" #")[0].strip()
+    except OSError:
+        pass
+    enabled = conf["enabled"].lower() != "false"
+    try:
+        speed = max(10.0, min(500.0, float(conf["speed"])))
+    except ValueError:
+        speed = 60.0
+    c = conf["color"].lstrip("#")
+    try:
+        rgb = (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+    except (ValueError, IndexError):
+        rgb = (0xB4, 0xA7, 0xFF)
+    return enabled, speed, rgb
+
+
+def color_sgr(c, fg):
+    table = FG if fg else BG
+    if c == "default":
+        return "39" if fg else "49"
+    if c in table:
+        return str(table[c])
+    if len(c) == 6:
+        try:
+            r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+            return "%d;2;%d;%d;%d" % (38 if fg else 48, r, g, b)
+        except ValueError:
+            pass
+    return "39" if fg else "49"
+
+
+def cell_bytes(ch, bg_override=None):
+    """Escape string that paints one buffer cell (optionally with a forced background)."""
+    codes = ["0"]
+    if ch.bold:
+        codes.append("1")
+    if ch.italics:
+        codes.append("3")
+    if ch.underscore:
+        codes.append("4")
+    if ch.blink:
+        codes.append("5")
+    if ch.reverse:
+        codes.append("7")
+    if ch.strikethrough:
+        codes.append("9")
+    codes.append(color_sgr(ch.fg, True))
+    codes.append(bg_override if bg_override else color_sgr(ch.bg, False))
+    return "\x1b[" + ";".join(codes) + "m" + (ch.data or " ")
+
+
+def get_winsize():
+    s = fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8)
+    rows, cols, _, _ = struct.unpack("HHHH", s)
+    return max(rows, 1), max(cols, 1)
+
+
+def set_winsize(fd, rows, cols):
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+class Smoother:
+    def __init__(self, rows, cols, speed, rgb):
+        self.main = pyte.Screen(cols, rows)
+        self.alt = pyte.Screen(cols, rows)
+        self.main_stream = pyte.ByteStream(self.main)
+        self.alt_stream = pyte.ByteStream(self.alt)
+        self.in_alt = False
+        self.speed = speed
+        self.bg = "48;2;%d;%d;%d" % rgb
+        self.fx = self.fy = None
+        self.drawn = set()
+        self.last = time.monotonic()
+
+    @property
+    def screen(self):
+        return self.alt if self.in_alt else self.main
+
+    @property
+    def stream(self):
+        return self.alt_stream if self.in_alt else self.main_stream
+
+    def resize(self, rows, cols):
+        self.main.resize(rows, cols)
+        self.alt.resize(rows, cols)
+        self.fx = self.fy = None
+        self.drawn.clear()
+
+    def feed(self, data):
+        """Feed child output into the tracked screens, handling alternate-screen switches."""
+        pos = 0
+        for m in ALT_RE.finditer(data):
+            self.stream.feed(data[pos:m.start()])
+            pos = m.end()
+            self.in_alt = m.group(1) == b"h"
+            if self.in_alt:
+                self.alt.reset()
+            self.fx = self.fy = None
+        self.stream.feed(data[pos:])
+
+    def erase(self):
+        """Escape string that removes the trail by repainting the real cell contents."""
+        if not self.drawn:
+            return ""
+        buf = self.screen.buffer
+        out = ["\x1b7"]
+        for (x, y) in self.drawn:
+            if 0 <= y < self.screen.lines and 0 <= x < self.screen.columns:
+                ch = buf[y][x]
+                if ch.data != "":
+                    out.append("\x1b[%d;%dH%s" % (y + 1, x + 1, cell_bytes(ch)))
+        out.append("\x1b[0m\x1b8")
+        self.drawn.clear()
+        return "".join(out)
+
+    def tick(self, bulk=False):
+        """Advance the animation. Returns (escape string, still_animating)."""
+        scr = self.screen
+        tx, ty = scr.cursor.x, scr.cursor.y
+        now = time.monotonic()
+        dt = min((now - self.last) * 1000.0, 50.0)
+        self.last = now
+
+        if scr.cursor.hidden or bulk or self.fx is None:
+            self.fx, self.fy = float(tx), float(ty)
+            return self.erase(), False
+
+        k = 1.0 - math.exp(-dt / self.speed)
+        self.fx += (tx - self.fx) * k
+        self.fy += (ty - self.fy) * k
+
+        if abs(tx - self.fx) + abs(ty - self.fy) < 0.6:
+            self.fx, self.fy = float(tx), float(ty)
+            return self.erase(), False
+
+        steps = int(max(abs(tx - self.fx), abs(ty - self.fy))) + 1
+        new = set()
+        for i in range(steps + 1):
+            t = i / steps
+            x = int(round(self.fx + (tx - self.fx) * t))
+            y = int(round(self.fy + (ty - self.fy) * t))
+            if (x, y) != (tx, ty) and 0 <= x < scr.columns and 0 <= y < scr.lines:
+                new.add((x, y))
+
+        buf = scr.buffer
+        out = ["\x1b7"]
+        for (x, y) in self.drawn - new:
+            ch = buf[y][x]
+            if ch.data != "":
+                out.append("\x1b[%d;%dH%s" % (y + 1, x + 1, cell_bytes(ch)))
+        for (x, y) in new - self.drawn:
+            ch = buf[y][x]
+            if ch.data != "":
+                out.append("\x1b[%d;%dH%s" % (y + 1, x + 1, cell_bytes(ch, self.bg)))
+        out.append("\x1b[0m\x1b8")
+        self.drawn = new
+        return "".join(out), True
+
+
+def main():
+    if not sys.stdin.isatty():
+        os.execvp(os.environ.get("SHELL", "sh"), [os.environ.get("SHELL", "sh")])
+
+    enabled, speed, rgb = load_conf()
+    cmd = os.environ.get("SMOOTHCURSOR_CMD")
+    argv = ["sh", "-c", cmd] if cmd else [os.environ.get("SHELL", "sh")]
+    os.environ["SMOOTHCURSOR"] = "1"
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp(argv[0], argv)
+
+    rows, cols = get_winsize()
+    set_winsize(fd, rows, cols)
+    sm = Smoother(rows, cols, speed, rgb)
+
+    resized = []
+    signal.signal(signal.SIGWINCH, lambda *_: resized.append(1))
+
+    old = termios.tcgetattr(0)
+    tty.setraw(0)
+    animating = False
+    out = sys.stdout.buffer
+
+    def emit(s):
+        if s:
+            out.write(s.encode("utf-8", "replace"))
+            out.flush()
+
+    try:
+        while True:
+            if resized:
+                resized.clear()
+                emit(sm.erase())
+                rows, cols = get_winsize()
+                set_winsize(fd, rows, cols)
+                sm.resize(rows, cols)
+            try:
+                r, _, _ = select.select([0, fd], [], [], 0.016 if animating else None)
+            except InterruptedError:
+                continue
+            except OSError:
+                continue
+
+            if 0 in r:
+                data = os.read(0, 4096)
+                if not data:
+                    break
+                os.write(fd, data)
+
+            if fd in r:
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                emit(sm.erase())  # clear trail before the child draws, so scrolling stays clean
+                out.write(data)
+                out.flush()
+                sm.feed(data)
+                if enabled:
+                    s, animating = sm.tick(bulk=len(data) > 2048)
+                    emit(s)
+                continue
+
+            if enabled and not r:
+                s, animating = sm.tick()
+                emit(s)
+    finally:
+        emit(sm.erase())
+        termios.tcsetattr(0, termios.TCSADRAIN, old)
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+
+BEGIN = "# >>> smoothcursor >>>"
+END = "# <<< smoothcursor <<<"
+BASH_BLOCK = (
+    BEGIN + "\n"
+    'if [ -t 0 ] && [ -z "$SMOOTHCURSOR" ] && [ ! -f "$HOME/.termux/smooth-cursor.off" ] && command -v smoothcursor >/dev/null 2>&1; then\n'
+    "    smoothcursor && exit\n"
+    "fi\n" + END + "\n"
+)
+FISH_BLOCK = (
+    BEGIN + "\n"
+    "if status is-interactive; and not set -q SMOOTHCURSOR; and not test -f $HOME/.termux/smooth-cursor.off; and type -q smoothcursor\n"
+    "    smoothcursor; and exit\n"
+    "end\n" + END + "\n"
+)
+RC_FILES = [
+    ("~/.bashrc", BASH_BLOCK),
+    ("~/.zshrc", BASH_BLOCK),
+    ("~/.config/fish/config.fish", FISH_BLOCK),
+]
+
+
+def strip_block(text):
+    a = text.find(BEGIN)
+    b = text.find(END)
+    if a == -1 or b == -1 or b < a:
+        return text, False
+    return (text[:a] + text[b + len(END):].lstrip("\n")), True
+
+
+def autostart(on):
+    for path, block in RC_FILES:
+        path = os.path.expanduser(path)
+        exists = os.path.exists(path)
+        text = open(path).read() if exists else ""
+        text, had = strip_block(text)
+        if on:
+            # only touch a rc file if it already exists (so we never switch the user's default shell)
+            if not exists:
+                continue
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += block
+        elif not had:
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        print(("autostart on: " if on else "autostart off: ") + path)
+    if on:
+        print("Open a new session to try it. Emergency off: touch ~/.termux/smooth-cursor.off")
+
+
+def set_conf(key, value):
+    if key not in ("enabled", "speed", "color"):
+        sys.exit("keys: enabled, speed, color")
+    conf = {}
+    try:
+        with open(CONF) as f:
+            for line in f:
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, v = line.split("=", 1)
+                    conf[k.strip()] = v.strip()
+    except OSError:
+        pass
+    conf[key] = value
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF, "w") as f:
+        for k, v in conf.items():
+            f.write("%s=%s\n" % (k, v))
+    print("saved %s=%s (applies to new sessions)" % (key, value))
+
+
+def uninstall():
+    autostart(False)
+    for p in (CONF, os.path.expanduser("~/.termux/smooth-cursor.off")):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    me = os.path.realpath(sys.argv[0])
+    try:
+        os.remove(me)
+        print("removed " + me)
+    except OSError as e:
+        print("could not remove %s: %s" % (me, e))
+    print("Done. Termux is back to stock behavior. (Optional: pip uninstall pyte)")
+
+
+def cli():
+    args = sys.argv[1:]
+    if not args:
+        return False
+    if args[0] == "autostart" and len(args) == 2 and args[1] in ("on", "off"):
+        autostart(args[1] == "on")
+    elif args[0] == "set" and len(args) == 3:
+        set_conf(args[1], args[2])
+    elif args[0] == "uninstall":
+        uninstall()
+    else:
+        print(__doc__)
+    return True
+
+
+if __name__ == "__main__":
+    if cli():
+        sys.exit(0)
+    try:
+        main()
+    except Exception as e:  # terminal already restored by main(); let the caller fall back to a plain shell
+        sys.stderr.write("smoothcursor: error: %r\n" % (e,))
+        sys.exit(70)
