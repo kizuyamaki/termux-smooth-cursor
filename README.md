@@ -3,7 +3,7 @@
 A smooth, trailing cursor for Termux. One-line install, **no APK, and Termux itself is never modified**.
 Remove it and everything goes back to stock.
 
-> **Note:** the trail moves one character cell at a time (not pixel-smooth) and may flicker slightly on some devices.
+> **How it looks:** the cursor glides to its new position and leaves a tapered, Neovide-style smear (a diagonal "\\" tail when it moves diagonally). It is drawn with Unicode block characters, so it is sub-cell smooth but not truly pixel-smooth. Text under the smear is hidden for a moment while it passes.
 
 ## Install
 
@@ -81,7 +81,7 @@ If a nested shell opened, typing `exit` once returns you to the normal shell. If
 
 ## How it works
 
-`smoothcursor` sits between Termux and your shell. It tracks the cursor position and paints a fading trail behind it using ordinary terminal escape codes. Before the shell draws anything new, the trail is erased, so the screen is never corrupted.
+`smoothcursor` sits between Termux and your shell. It hides Termux's own cursor and draws its own, so the cursor you see always matches the smear. It tracks the real cursor position, animates the four corners of the cursor shape with different speeds (leading corners fast, trailing corners slow), and paints the result with block characters (`▌ ▄ ▚ ▟` ...). It follows the cursor shape set by programs (block, underline, bar). Before the shell draws anything new, the overlay is erased and redrawn in the same write, so the screen is never corrupted and the cursor does not flicker.
 
 ## License
 

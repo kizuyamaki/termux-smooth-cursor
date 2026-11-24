@@ -112,7 +112,96 @@ def set_winsize(fd, rows, cols):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
+# ---------------------------------------------------------------------------
+# Glyph table: every candidate glyph with the 8x8 "ink" mask it paints.
+# bit index = row * 8 + col (row 0 = top, col 0 = left).
+# Each glyph is also usable "inverted" (colors swapped) which paints the complement.
+# ---------------------------------------------------------------------------
+def _mask(fn):
+    m = 0
+    for r in range(8):
+        for c in range(8):
+            if fn(r, c):
+                m |= 1 << (r * 8 + c)
+    return m
+
+
+def _quad(ul, ur, ll, lr):
+    return _mask(lambda r, c: (ul and r < 4 and c < 4) or (ur and r < 4 and c >= 4)
+                 or (ll and r >= 4 and c < 4) or (lr and r >= 4 and c >= 4))
+
+
+_GLYPHS = [(" ", 0), ("\u2588", _mask(lambda r, c: True))]
+for _n, _ch in enumerate("\u258f\u258e\u258d\u258c\u258b\u258a\u2589", 1):          # left 1/8 .. 7/8
+    _GLYPHS.append((_ch, _mask(lambda r, c, n=_n: c < n)))
+for _n, _ch in enumerate("\u2581\u2582\u2583\u2584\u2585\u2586\u2587", 1):          # lower 1/8 .. 7/8
+    _GLYPHS.append((_ch, _mask(lambda r, c, n=_n: r >= 8 - n)))
+_GLYPHS += [
+    ("\u2594", _mask(lambda r, c: r < 1)), ("\u2595", _mask(lambda r, c: c >= 7)),
+    ("\u2580", _mask(lambda r, c: r < 4)), ("\u2590", _mask(lambda r, c: c >= 4)),
+    ("\u2598", _quad(1, 0, 0, 0)), ("\u259d", _quad(0, 1, 0, 0)),
+    ("\u2596", _quad(0, 0, 1, 0)), ("\u2597", _quad(0, 0, 0, 1)),
+    ("\u259a", _quad(1, 0, 0, 1)), ("\u259e", _quad(0, 1, 1, 0)),
+    ("\u2599", _quad(1, 0, 1, 1)), ("\u259b", _quad(1, 1, 1, 0)),
+    ("\u259c", _quad(1, 1, 0, 1)), ("\u259f", _quad(0, 1, 1, 1)),
+]
+_FULL = (1 << 64) - 1
+_CANDS = []
+for _g, _m in _GLYPHS:
+    _CANDS.append((_g, _m, False))
+    _CANDS.append((_g, _FULL ^ _m, True))
+_PICK_CACHE = {}
+
+
+def pick_glyph(cov):
+    """Best (glyph, inverted) for an 8x8 coverage mask."""
+    hit = _PICK_CACHE.get(cov)
+    if hit is None:
+        best = None
+        for g, m, inv in _CANDS:
+            d = bin(cov ^ m).count("1")
+            if best is None or d < best[0]:
+                best = (d, g, inv)
+        hit = (best[1], best[2])
+        _PICK_CACHE[cov] = hit
+    return hit
+
+
+def rasterize(poly, rows, cols):
+    """Scanline-fill a polygon (cell units) into {(col,row): 8x8 coverage mask}."""
+    cells = {}
+    ys = [p[1] for p in poly]
+    r0 = max(0, int(math.floor(min(ys))))
+    r1 = min(rows - 1, int(math.floor(max(ys))))
+    n = len(poly)
+    for row in range(r0, r1 + 1):
+        for sy in range(8):
+            y = row + (sy + 0.5) / 8.0
+            xs = []
+            for i in range(n):
+                x1, y1 = poly[i]
+                x2, y2 = poly[(i + 1) % n]
+                if (y1 <= y < y2) or (y2 <= y < y1):
+                    xs.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+            xs.sort()
+            for j in range(0, len(xs) - 1, 2):
+                sx0 = max(0, int(math.ceil(xs[j] * 8 - 0.5)))
+                sx1 = min(cols * 8 - 1, int(math.ceil(xs[j + 1] * 8 - 0.5)) - 1)
+                for sx in range(sx0, sx1 + 1):
+                    key = (sx >> 3, row)
+                    cells[key] = cells.get(key, 0) | (1 << (sy * 8 + (sx & 7)))
+    return cells
+
+
+# DECSCUSR shapes -> (x0, y0, x1, y1) of the cursor inside its cell
+SHAPES = {"block": (0.0, 0.0, 1.0, 1.0), "underline": (0.0, 0.84, 1.0, 1.0), "bar": (0.0, 0.0, 0.16, 1.0)}
+SHAPE_RE = re.compile(rb"\x1b\[(\d*) q")
+LEAD = 0.2  # leading corners move this much faster than the trailing ones
+
+
 class Smoother:
+    """Tracks the screen and draws our own cursor (real one is hidden) with a Neovide-style smear."""
+
     def __init__(self, rows, cols, speed, rgb):
         self.main = pyte.Screen(cols, rows)
         self.alt = pyte.Screen(cols, rows)
@@ -120,9 +209,13 @@ class Smoother:
         self.alt_stream = pyte.ByteStream(self.alt)
         self.in_alt = False
         self.speed = speed
-        self.bg = "48;2;%d;%d;%d" % rgb
-        self.fx = self.fy = None
-        self.drawn = set()
+        self.rgb = rgb
+        self.shape = "block"
+        self.target = None          # (col, row) of the cursor we last animated toward
+        self.cx = [0.0] * 4         # animated corner positions (TL, TR, BR, BL)
+        self.cy = [0.0] * 4
+        self.fac = [1.0] * 4        # per-corner time-constant factor
+        self.drawn = {}             # (col,row) -> escape string currently painted
         self.last = time.monotonic()
 
     @property
@@ -136,11 +229,14 @@ class Smoother:
     def resize(self, rows, cols):
         self.main.resize(rows, cols)
         self.alt.resize(rows, cols)
-        self.fx = self.fy = None
+        self.target = None
         self.drawn.clear()
 
     def feed(self, data):
-        """Feed child output into the tracked screens, handling alternate-screen switches."""
+        """Feed child output into the tracked screens (alternate-screen + cursor-shape aware)."""
+        for m in SHAPE_RE.finditer(data):
+            n = int(m.group(1) or 0)
+            self.shape = "block" if n <= 2 else ("underline" if n <= 4 else "bar")
         pos = 0
         for m in ALT_RE.finditer(data):
             self.stream.feed(data[pos:m.start()])
@@ -148,66 +244,105 @@ class Smoother:
             self.in_alt = m.group(1) == b"h"
             if self.in_alt:
                 self.alt.reset()
-            self.fx = self.fy = None
+            self.target = None
         self.stream.feed(data[pos:])
 
+    # -- painting helpers -------------------------------------------------
+    def _plain(self, x, y):
+        ch = self.screen.buffer[y][x]
+        return "\x1b[%d;%dH%s" % (y + 1, x + 1, cell_bytes(ch)) if ch.data != "" else ""
+
     def erase(self):
-        """Escape string that removes the trail by repainting the real cell contents."""
+        """Escape string that removes our cursor by repainting the real cell contents."""
         if not self.drawn:
             return ""
-        buf = self.screen.buffer
         out = ["\x1b7"]
         for (x, y) in self.drawn:
             if 0 <= y < self.screen.lines and 0 <= x < self.screen.columns:
-                ch = buf[y][x]
-                if ch.data != "":
-                    out.append("\x1b[%d;%dH%s" % (y + 1, x + 1, cell_bytes(ch)))
+                out.append(self._plain(x, y))
         out.append("\x1b[0m\x1b8")
-        self.drawn.clear()
+        self.drawn = {}
         return "".join(out)
 
+    def _paint(self, x, y, cov, is_target):
+        ch = self.screen.buffer[y][x]
+        if ch.data == "":
+            return ""
+        r, g, b = self.rgb
+        trail = "38;2;%d;%d;%d" % (r, g, b)
+        cellbg = color_sgr(ch.fg if ch.reverse else ch.bg, False)
+        if is_target and bin(cov).count("1") >= 56 and self.shape == "block":
+            # steady block cursor: show the character in reverse on the cursor color
+            bold = "1;" if ch.bold else ""
+            return "\x1b[%d;%dH\x1b[0;%s%s;%s;7m%s" % (y + 1, x + 1, bold, trail, cellbg, ch.data or " ")
+        glyph, inv = pick_glyph(cov)
+        if glyph == " " and not inv:
+            return ""
+        if inv:
+            return "\x1b[%d;%dH\x1b[0;%s;%s;7m%s" % (y + 1, x + 1, trail, cellbg, glyph)
+        return "\x1b[%d;%dH\x1b[0;%s;%sm%s" % (y + 1, x + 1, trail, cellbg, glyph)
+
     def tick(self, bulk=False):
-        """Advance the animation. Returns (escape string, still_animating)."""
+        """Advance the animation one step. Returns (escape string, still_animating)."""
         scr = self.screen
+        if scr.cursor.hidden:
+            return self.erase(), False
+
         tx, ty = scr.cursor.x, scr.cursor.y
+        x0, y0, x1, y1 = SHAPES[self.shape]
+        tcx = [tx + x0, tx + x1, tx + x1, tx + x0]
+        tcy = [ty + y0, ty + y0, ty + y1, ty + y1]
+
         now = time.monotonic()
         dt = min((now - self.last) * 1000.0, 50.0)
         self.last = now
 
-        if scr.cursor.hidden or bulk or self.fx is None:
-            self.fx, self.fy = float(tx), float(ty)
-            return self.erase(), False
+        if self.target is None or bulk:
+            self.cx, self.cy = tcx[:], tcy[:]
+            self.fac = [1.0] * 4
+            self.target = (tx, ty)
+        elif self.target != (tx, ty):
+            # destination changed: leading corners (facing the move) become fast, trailing ones slow
+            mx, my = sum(self.cx) / 4.0, sum(self.cy) / 4.0
+            dx, dy = (tx + 0.5) - mx, (ty + 0.5) - my
+            norm = math.hypot(dx, dy) or 1.0
+            rel = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
+            dots = [(rx * dx + ry * dy) / norm for rx, ry in rel]
+            lo, hi = min(dots), max(dots)
+            span = hi - lo
+            self.fac = [1.0 if span < 1e-6 else LEAD + (1.0 - LEAD) * (1.0 - (d - lo) / span) for d in dots]
+            self.target = (tx, ty)
 
-        k = 1.0 - math.exp(-dt / self.speed)
-        self.fx += (tx - self.fx) * k
-        self.fy += (ty - self.fy) * k
+        settled = True
+        for i in range(4):
+            k = 1.0 - math.exp(-dt / (self.speed * self.fac[i]))
+            self.cx[i] += (tcx[i] - self.cx[i]) * k
+            self.cy[i] += (tcy[i] - self.cy[i]) * k
+            if abs(tcx[i] - self.cx[i]) + abs(tcy[i] - self.cy[i]) > 0.03:
+                settled = False
+        if settled:
+            self.cx, self.cy = tcx[:], tcy[:]
 
-        if abs(tx - self.fx) + abs(ty - self.fy) < 0.6:
-            self.fx, self.fy = float(tx), float(ty)
-            return self.erase(), False
+        poly = list(zip(self.cx, self.cy))
+        cells = rasterize(poly, scr.lines, scr.columns)
+        new = {}
+        for (x, y), cov in cells.items():
+            if 0 <= x < scr.columns and 0 <= y < scr.lines:
+                new[(x, y)] = self._paint(x, y, cov, (x, y) == (tx, ty))
 
-        steps = int(max(abs(tx - self.fx), abs(ty - self.fy))) + 1
-        new = set()
-        for i in range(steps + 1):
-            t = i / steps
-            x = int(round(self.fx + (tx - self.fx) * t))
-            y = int(round(self.fy + (ty - self.fy) * t))
-            if (x, y) != (tx, ty) and 0 <= x < scr.columns and 0 <= y < scr.lines:
-                new.add((x, y))
-
-        buf = scr.buffer
         out = ["\x1b7"]
-        for (x, y) in self.drawn - new:
-            ch = buf[y][x]
-            if ch.data != "":
-                out.append("\x1b[%d;%dH%s" % (y + 1, x + 1, cell_bytes(ch)))
-        for (x, y) in new - self.drawn:
-            ch = buf[y][x]
-            if ch.data != "":
-                out.append("\x1b[%d;%dH%s" % (y + 1, x + 1, cell_bytes(ch, self.bg)))
+        for (x, y) in self.drawn:
+            if (x, y) not in new:
+                out.append(self._plain(x, y))
+        for key, esc in new.items():
+            if self.drawn.get(key) != esc:
+                out.append(esc if esc else self._plain(*key))
         out.append("\x1b[0m\x1b8")
         self.drawn = new
-        return "".join(out), True
+        return "".join(out), not settled
+
+
+HIDE_SHOW_RE = re.compile(rb"\x1b\[\?25[hl]")
 
 
 def main():
@@ -240,6 +375,8 @@ def main():
             out.write(s.encode("utf-8", "replace"))
             out.flush()
 
+    if enabled:
+        emit("\x1b[?25l")  # hide Termux's own cursor; we draw ours
     try:
         while True:
             if resized:
@@ -250,9 +387,7 @@ def main():
                 sm.resize(rows, cols)
             try:
                 r, _, _ = select.select([0, fd], [], [], 0.016 if animating else None)
-            except InterruptedError:
-                continue
-            except OSError:
+            except (InterruptedError, OSError):
                 continue
 
             if 0 in r:
@@ -268,20 +403,26 @@ def main():
                     break
                 if not data:
                     break
-                emit(sm.erase())  # clear trail before the child draws, so scrolling stays clean
-                out.write(data)
-                out.flush()
+                if not enabled:
+                    out.write(data)
+                    out.flush()
+                    continue
+                pre = sm.erase()          # clear our cursor before the child draws (keeps scrolling clean)
                 sm.feed(data)
-                if enabled:
-                    s, animating = sm.tick(bulk=len(data) > 2048)
-                    emit(s)
+                shown = HIDE_SHOW_RE.sub(b"", data)   # keep Termux's real cursor hidden
+                post, animating = sm.tick(bulk=len(data) > 2048)
+                # one single write so the cursor never flickers between erase and redraw
+                out.write(pre.encode("utf-8", "replace") + shown + post.encode("utf-8", "replace"))
+                out.flush()
                 continue
 
             if enabled and not r:
                 s, animating = sm.tick()
                 emit(s)
     finally:
-        emit(sm.erase())
+        if enabled:
+            emit(sm.erase())
+            emit("\x1b[?25h")
         termios.tcsetattr(0, termios.TCSADRAIN, old)
         try:
             os.waitpid(pid, 0)
