@@ -6,14 +6,15 @@ fading trail behind it using normal terminal escape codes.
 
 Commands:
     smoothcursor                      start a shell with the smooth cursor
-    smoothcursor set <key> <value>    change a setting (enabled / speed / color)
+    smoothcursor set <key> <value>    change a setting (enabled, speed, color, size, width, height)
     smoothcursor autostart on|off     start it automatically in every new session
     smoothcursor uninstall            remove everything and restore stock behavior
 
 Config (optional): ~/.termux/smooth-cursor.conf
     enabled=true     # true / false
     speed=60         # 10-500 ms, lower = faster
-    color=#b4a7ff    # trail color
+    color=#ffffff    # cursor color
+    size=100         # 1-100, cursor size in percent of the cell (width / height can be set separately)
 """
 import fcntl
 import math
@@ -44,27 +45,38 @@ BG = {v: k for k, v in list(pg.BG_ANSI.items()) + list(pg.BG_AIXTERM.items())}
 
 
 def load_conf():
-    conf = {"enabled": "true", "speed": "60", "color": "#b4a7ff"}
+    conf = {"enabled": "true", "speed": "60", "color": "#ffffff", "size": "100"}
     try:
         with open(CONF) as f:
             for line in f:
-                line = line.split("#", 1)[0] if not line.lstrip().startswith("color") else line
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    conf[k.strip()] = v.split(" #")[0].strip()
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.strip()
+                if not v.startswith("#"):
+                    v = v.split("#", 1)[0].strip()
+                conf[k.strip()] = v
     except OSError:
         pass
+
+    def num(key, default, lo, hi):
+        try:
+            return max(lo, min(hi, float(conf.get(key, default))))
+        except ValueError:
+            return float(default)
+
     enabled = conf["enabled"].lower() != "false"
-    try:
-        speed = max(10.0, min(500.0, float(conf["speed"])))
-    except ValueError:
-        speed = 60.0
+    speed = num("speed", 60, 10, 500)
+    size = num("size", 100, 1, 100)
+    wp = num("width", size, 1, 100) / 100.0
+    hp = num("height", size, 1, 100) / 100.0
     c = conf["color"].lstrip("#")
     try:
         rgb = (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
     except (ValueError, IndexError):
-        rgb = (0xB4, 0xA7, 0xFF)
-    return enabled, speed, rgb
+        rgb = (255, 255, 255)
+    return enabled, speed, rgb, wp, hp
 
 
 def color_sgr(c, fg):
@@ -194,7 +206,10 @@ def rasterize(poly, rows, cols):
 
 
 # DECSCUSR shapes -> (x0, y0, x1, y1) of the cursor inside its cell
-SHAPES = {"block": (0.0, 0.0, 1.0, 1.0), "underline": (0.0, 0.84, 1.0, 1.0), "bar": (0.0, 0.0, 0.16, 1.0)}
+# Same proportions Termux uses: underline is 1/4 of the cell height, bar is 1/4 of the width.
+THICK = 0.25
+# The glyph grid is 8x8 per cell, so anything thinner than ~1/8 of a cell would vanish; keep at least this much.
+MIN_DIM = 0.14
 SHAPE_RE = re.compile(rb"\x1b\[(\d*) q")
 LEAD = 0.2  # leading corners move this much faster than the trailing ones
 
@@ -202,7 +217,7 @@ LEAD = 0.2  # leading corners move this much faster than the trailing ones
 class Smoother:
     """Tracks the screen and draws our own cursor (real one is hidden) with a Neovide-style smear."""
 
-    def __init__(self, rows, cols, speed, rgb):
+    def __init__(self, rows, cols, speed, rgb, wp=1.0, hp=1.0):
         self.main = pyte.Screen(cols, rows)
         self.alt = pyte.Screen(cols, rows)
         self.main_stream = pyte.ByteStream(self.main)
@@ -210,11 +225,14 @@ class Smoother:
         self.in_alt = False
         self.speed = speed
         self.rgb = rgb
+        self.wp, self.hp = wp, hp
         self.shape = "block"
         self.target = None          # (col, row) of the cursor we last animated toward
         self.cx = [0.0] * 4         # animated corner positions (TL, TR, BR, BL)
         self.cy = [0.0] * 4
         self.fac = [1.0] * 4        # per-corner time-constant factor
+        self.newline_hint = False   # child output contained a line feed since the last tick
+        self.dropping = False       # cursor is dropping in from the row above (after Enter)
         self.drawn = {}             # (col,row) -> escape string currently painted
         self.last = time.monotonic()
 
@@ -226,17 +244,63 @@ class Smoother:
     def stream(self):
         return self.alt_stream if self.in_alt else self.main_stream
 
-    def resize(self, rows, cols):
-        self.main.resize(rows, cols)
-        self.alt.resize(rows, cols)
+    def reset_blank(self, rows, cols):
+        """Forget everything (used when the column count changed and Termux re-wrapped all text)."""
+        self.main = pyte.Screen(cols, rows)
+        self.alt = pyte.Screen(cols, rows)
+        self.main_stream = pyte.ByteStream(self.main)
+        self.alt_stream = pyte.ByteStream(self.alt)
         self.target = None
-        self.drawn.clear()
+        self.drawn = {}
+
+    def resync(self, rows, cols, ry, rx):
+        """After a window resize: rebuild the model so it lines up with what Termux really shows.
+
+        (ry, rx) is the real cursor position reported by the terminal. Termux keeps the cursor row
+        visible when it resizes, so we shift our copy of the screen by the same amount.
+        """
+        active = self.screen
+        off = ry - active.cursor.y
+        moved = {}
+        for key, esc in self.drawn.items():
+            moved[(key[0], key[1] + off)] = esc
+
+        def rebuild(old, shift):
+            new = pyte.Screen(cols, rows)
+            for y in range(old.lines):
+                ny = y + shift
+                if 0 <= ny < rows:
+                    for x in range(min(cols, old.columns)):
+                        new.buffer[ny][x] = old.buffer[y][x]
+            new.mode = set(old.mode)
+            new.cursor.attrs = old.cursor.attrs
+            new.cursor.hidden = old.cursor.hidden
+            return new
+
+        new_main = rebuild(self.main, off if not self.in_alt else 0)
+        new_alt = rebuild(self.alt, off if self.in_alt else 0)
+        act = new_alt if self.in_alt else new_main
+        act.cursor.y = max(0, min(rows - 1, ry))
+        act.cursor.x = max(0, min(cols - 1, rx))
+        self.main, self.alt = new_main, new_alt
+        self.main_stream = pyte.ByteStream(self.main)
+        self.alt_stream = pyte.ByteStream(self.alt)
+        self.target = None
+        self.drawn = moved
+        return self.erase()
 
     def feed(self, data):
         """Feed child output into the tracked screens (alternate-screen + cursor-shape aware)."""
+        if b"\n" in data:
+            self.newline_hint = True
         for m in SHAPE_RE.finditer(data):
             n = int(m.group(1) or 0)
-            self.shape = "block" if n <= 2 else ("underline" if n <= 4 else "bar")
+            if n <= 2:
+                self.shape = "block"
+            elif n <= 4:
+                self.shape = "underline"
+            elif n <= 6:
+                self.shape = "bar"
         pos = 0
         for m in ALT_RE.finditer(data):
             self.stream.feed(data[pos:m.start()])
@@ -271,7 +335,7 @@ class Smoother:
         r, g, b = self.rgb
         trail = "38;2;%d;%d;%d" % (r, g, b)
         cellbg = color_sgr(ch.fg if ch.reverse else ch.bg, False)
-        if is_target and bin(cov).count("1") >= 56 and self.shape == "block":
+        if is_target and bin(cov).count("1") >= 56 and self.shape == "block" and self.wp >= 0.99 and self.hp >= 0.99:
             # steady block cursor: show the character in reverse on the cursor color
             bold = "1;" if ch.bold else ""
             return "\x1b[%d;%dH\x1b[0;%s%s;%s;7m%s" % (y + 1, x + 1, bold, trail, cellbg, ch.data or " ")
@@ -288,8 +352,36 @@ class Smoother:
         if scr.cursor.hidden:
             return self.erase(), False
 
-        tx, ty = scr.cursor.x, scr.cursor.y
-        x0, y0, x1, y1 = SHAPES[self.shape]
+        # Termux keeps the cursor on the last column while a wrap is pending; pyte lets x reach `columns`.
+        tx, ty = min(scr.cursor.x, scr.columns - 1), scr.cursor.y
+        cw = 1
+        here = scr.buffer[ty][tx]
+        if here.data == "" and tx > 0:
+            tx -= 1          # cursor on the 2nd half of a wide character
+            cw = 2
+        elif tx + 1 < scr.columns and scr.buffer[ty][tx + 1].data == "" and here.data not in ("", " "):
+            cw = 2           # Termux draws the cursor over both cells of a wide character
+        if self.shape == "bar":
+            w, x0 = THICK * self.wp, 0.0
+        else:
+            w = cw * self.wp
+            x0 = (cw - w) / 2.0
+        if self.shape == "underline":
+            h = THICK * self.hp
+            y0 = 1.0 - h
+        elif self.shape == "bar":
+            h = self.hp
+            y0 = (1.0 - h) / 2.0
+        else:
+            h = self.hp
+            y0 = (1.0 - h) / 2.0
+        if h < MIN_DIM:
+            y0 -= (MIN_DIM - h) / 2.0 if self.shape != "underline" else (MIN_DIM - h)
+            h = MIN_DIM
+        if w < MIN_DIM:
+            x0 -= (MIN_DIM - w) / 2.0 if self.shape != "bar" else 0.0
+            w = MIN_DIM
+        x1, y1 = x0 + w, y0 + h
         tcx = [tx + x0, tx + x1, tx + x1, tx + x0]
         tcy = [ty + y0, ty + y0, ty + y1, ty + y1]
 
@@ -302,16 +394,29 @@ class Smoother:
             self.fac = [1.0] * 4
             self.target = (tx, ty)
         elif self.target != (tx, ty):
-            # destination changed: leading corners (facing the move) become fast, trailing ones slow
-            mx, my = sum(self.cx) / 4.0, sum(self.cy) / 4.0
-            dx, dy = (tx + 0.5) - mx, (ty + 0.5) - my
-            norm = math.hypot(dx, dy) or 1.0
-            rel = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
-            dots = [(rx * dx + ry * dy) / norm for rx, ry in rel]
-            lo, hi = min(dots), max(dots)
-            span = hi - lo
-            self.fac = [1.0 if span < 1e-6 else LEAD + (1.0 - LEAD) * (1.0 - (d - lo) / span) for d in dots]
+            ox, oy = self.target
+            if self.newline_hint and not self.in_alt and ty >= oy:
+                # Enter / newline: the cursor visibly drops in from the row above, straight down.
+                # (also when the screen scrolled and the cursor stays on the last row)
+                self.dropping = True
+                self.cx = tcx[:]
+                self.cy = [v - 1.0 for v in tcy]
+                self.fac = [1.3, 1.3, 0.7, 0.7]      # bottom edge leads, top edge trails
+            elif self.dropping:
+                # the prompt is being printed while we fall: keep falling straight down, no sideways slide
+                self.cx = tcx[:]
+            else:
+                # destination changed: leading corners (facing the move) become fast, trailing ones slow
+                mx, my = sum(self.cx) / 4.0, sum(self.cy) / 4.0
+                dx, dy = (tx + 0.5) - mx, (ty + 0.5) - my
+                norm = math.hypot(dx, dy) or 1.0
+                rel = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
+                dots = [(rx * dx + ry * dy) / norm for rx, ry in rel]
+                lo, hi = min(dots), max(dots)
+                span = hi - lo
+                self.fac = [1.0 if span < 1e-6 else LEAD + (1.0 - LEAD) * (1.0 - (d - lo) / span) for d in dots]
             self.target = (tx, ty)
+        self.newline_hint = False
 
         settled = True
         for i in range(4):
@@ -322,6 +427,7 @@ class Smoother:
                 settled = False
         if settled:
             self.cx, self.cy = tcx[:], tcy[:]
+            self.dropping = False
 
         poly = list(zip(self.cx, self.cy))
         cells = rasterize(poly, scr.lines, scr.columns)
@@ -343,13 +449,14 @@ class Smoother:
 
 
 HIDE_SHOW_RE = re.compile(rb"\x1b\[\?25[hl]")
+DSR_RE = re.compile(rb"\x1b\[(\d+);(\d+)R")
 
 
 def main():
     if not sys.stdin.isatty():
         os.execvp(os.environ.get("SHELL", "sh"), [os.environ.get("SHELL", "sh")])
 
-    enabled, speed, rgb = load_conf()
+    enabled, speed, rgb, wp, hp = load_conf()
     cmd = os.environ.get("SMOOTHCURSOR_CMD")
     argv = ["sh", "-c", cmd] if cmd else [os.environ.get("SHELL", "sh")]
     os.environ["SMOOTHCURSOR"] = "1"
@@ -360,7 +467,7 @@ def main():
 
     rows, cols = get_winsize()
     set_winsize(fd, rows, cols)
-    sm = Smoother(rows, cols, speed, rgb)
+    sm = Smoother(rows, cols, speed, rgb, wp, hp)
 
     resized = []
     signal.signal(signal.SIGWINCH, lambda *_: resized.append(1))
@@ -369,32 +476,67 @@ def main():
     tty.setraw(0)
     animating = False
     out = sys.stdout.buffer
+    awaiting = None    # deadline while we wait for the terminal to report its cursor after a resize
+    pending = None
 
     def emit(s):
         if s:
             out.write(s.encode("utf-8", "replace"))
             out.flush()
 
+    def finish_resize(ry, rx):
+        nonlocal awaiting
+        rws, cls = pending
+        if cls != sm.main.columns:
+            # Width changed: Termux re-wrapped every line, our copy of the screen is meaningless.
+            # Start over from a blank screen (old text stays in scrollback), like at startup.
+            alt = sm.in_alt
+            sm.reset_blank(rws, cls)
+            sm.in_alt = alt
+            emit("\x1b[2J\x1b[H" if alt else "\n" * rws + "\x1b[H")
+        else:
+            emit(sm.resync(rws, cls, ry, rx))
+        set_winsize(fd, rws, cls)   # only now does the child learn the new size and redraw
+        awaiting = None
+
     if enabled:
-        emit("\x1b[?25l")  # hide Termux's own cursor; we draw ours
+        # Our model starts empty, so push whatever is on screen into scrollback (like `clear`, history kept)
+        # and start from a blank screen with the cursor at the top. Termux's own cursor stays hidden.
+        emit("\x1b[?25l" + "\n" * rows + "\x1b[H")
     try:
         while True:
             if resized:
                 resized.clear()
-                emit(sm.erase())
-                rows, cols = get_winsize()
-                set_winsize(fd, rows, cols)
-                sm.resize(rows, cols)
+                if enabled:
+                    pending = get_winsize()
+                    emit("\x1b[6n")                       # ask where the real cursor is
+                    awaiting = time.monotonic() + 0.5
+                else:
+                    set_winsize(fd, *get_winsize())
+            timeout = 0.016 if animating else None
+            if awaiting is not None:
+                left = max(0.0, awaiting - time.monotonic())
+                timeout = left if timeout is None else min(timeout, left)
             try:
-                r, _, _ = select.select([0, fd], [], [], 0.016 if animating else None)
+                r, _, _ = select.select([0, fd], [], [], timeout)
             except (InterruptedError, OSError):
+                continue
+
+            if awaiting is not None and not r and time.monotonic() >= awaiting:
+                finish_resize(sm.screen.cursor.y, sm.screen.cursor.x)   # no answer: keep our own idea
                 continue
 
             if 0 in r:
                 data = os.read(0, 4096)
                 if not data:
                     break
-                os.write(fd, data)
+                if awaiting is not None:
+                    m = DSR_RE.search(data)
+                    if m:
+                        data = DSR_RE.sub(b"", data, 1)
+                        finish_resize(int(m.group(1)) - 1, int(m.group(2)) - 1)
+                if data:
+                    os.write(fd, data)
 
             if fd in r:
                 try:
@@ -407,6 +549,12 @@ def main():
                     out.write(data)
                     out.flush()
                     continue
+                if awaiting is not None:
+                    # model is out of sync until the terminal answers: pass through, draw nothing
+                    sm.feed(data)
+                    out.write(HIDE_SHOW_RE.sub(b"", data))
+                    out.flush()
+                    continue
                 pre = sm.erase()          # clear our cursor before the child draws (keeps scrolling clean)
                 sm.feed(data)
                 shown = HIDE_SHOW_RE.sub(b"", data)   # keep Termux's real cursor hidden
@@ -416,12 +564,13 @@ def main():
                 out.flush()
                 continue
 
-            if enabled and not r:
+            if enabled and not r and awaiting is None:
                 s, animating = sm.tick()
                 emit(s)
     finally:
         if enabled:
-            emit(sm.erase())
+            if awaiting is None:
+                emit(sm.erase())
             emit("\x1b[?25h")
         termios.tcsetattr(0, termios.TCSADRAIN, old)
         try:
@@ -459,16 +608,22 @@ def strip_block(text):
     return (text[:a] + text[b + len(END):].lstrip("\n")), True
 
 
+def login_rc():
+    """The rc file of the shell Termux actually starts (so autostart works on a fresh install)."""
+    name = os.path.basename(os.environ.get("SHELL", "bash"))
+    return {"fish": "~/.config/fish/config.fish", "zsh": "~/.zshrc"}.get(name, "~/.bashrc")
+
+
 def autostart(on):
+    own = os.path.expanduser(login_rc())
     for path, block in RC_FILES:
         path = os.path.expanduser(path)
         exists = os.path.exists(path)
+        if on and not exists and path != own:
+            continue   # never touch rc files of shells the user does not use
         text = open(path).read() if exists else ""
         text, had = strip_block(text)
         if on:
-            # only touch a rc file if it already exists (so we never switch the user's default shell)
-            if not exists:
-                continue
             if text and not text.endswith("\n"):
                 text += "\n"
             text += block
@@ -479,12 +634,22 @@ def autostart(on):
             f.write(text)
         print(("autostart on: " if on else "autostart off: ") + path)
     if on:
-        print("Open a new session to try it. Emergency off: touch ~/.termux/smooth-cursor.off")
+        print("Open a new session to see it. Turn off: smoothcursor autostart off")
 
 
 def set_conf(key, value):
-    if key not in ("enabled", "speed", "color"):
-        sys.exit("keys: enabled, speed, color")
+    if key not in ("enabled", "speed", "color", "size", "width", "height"):
+        sys.exit("keys: enabled, speed, color, size, width, height")
+    if key in ("size", "width", "height"):
+        try:
+            if not 1 <= float(value) <= 100:
+                raise ValueError
+        except ValueError:
+            sys.exit("%s must be a number from 1 to 100" % key)
+    if key == "size":
+        conf_drop = ("width", "height")   # `size` sets both, so forget separate overrides
+    else:
+        conf_drop = ()
     conf = {}
     try:
         with open(CONF) as f:
@@ -495,6 +660,8 @@ def set_conf(key, value):
     except OSError:
         pass
     conf[key] = value
+    for k in conf_drop:
+        conf.pop(k, None)
     os.makedirs(os.path.dirname(CONF), exist_ok=True)
     with open(CONF, "w") as f:
         for k, v in conf.items():
